@@ -1,33 +1,46 @@
-import type {
-  HarnessV1NetworkSandboxSession,
-  HarnessV1SandboxProvider,
+import {
+  HarnessSandboxAuthenticationError,
+  type HarnessV1NetworkSandboxSession,
+  type HarnessV1SandboxProvider,
+  type HarnessV1SandboxSessionCreateOptions,
+  type HarnessV1SandboxSessionResumeOptions,
 } from '@ai-sdk/harness';
 import type { Experimental_SandboxSession as SandboxSession } from '@ai-sdk/provider-utils';
 import { createHash, randomUUID } from 'node:crypto';
 import {
   SPRITES_DEFAULT_BASE_URL,
   SpritesApiClient,
+  SpritesApiError,
   type SpriteUrlAuth,
 } from './sprites-api-client';
 import { SpritesNetworkSandboxSession } from './sprites-network-sandbox-session';
+import { SpritesSandboxSession } from './sprites-sandbox-session';
 
 const SPRITES_PROVIDER_ID = 'sprites-sandbox';
-
-/**
- * Login directory of the Sprite base image (`sprite` user). Used as the
- * session working directory and the base for resolving relative paths. Override
- * via {@link SpritesConnectionSettings.workingDirectory}.
- */
-const DEFAULT_WORKING_DIRECTORY = '/home/sprite';
 
 const SESSION_NAME_PREFIX = 'ai-sdk-harness-session';
 const TEMPLATE_NAME_PREFIX = 'ai-sdk-harness-tmpl';
 const PREWARM_NAME_PREFIX = 'ai-sdk-harness';
 
+/**
+ * Bridge-backed harness adapters install their in-sandbox bridge with `pnpm`.
+ * The stock Sprite image ships `node`, `npm` and `corepack` but no `pnpm` on
+ * `PATH`, so a Sprite created here gets it before anything else runs. A
+ * Sprite that already has `pnpm` is left as it is.
+ */
+const PNPM_SETUP_COMMAND =
+  'command -v pnpm >/dev/null 2>&1 || ' +
+  '{ corepack enable --install-directory /usr/local/bin pnpm && ' +
+  'corepack prepare pnpm@11 --activate; }';
+
 /** Written into a Sprite once `onFirstCreate` succeeds, keyed by identity. */
 const BOOTSTRAP_MARKER = new TextEncoder().encode('done');
 
-/** Connection and shared settings for {@link createSpritesSandbox}. */
+/**
+ * Connection and shared settings for
+ * {@link createSpritesNetworkSandboxSession},
+ * {@link resumeSpritesNetworkSandboxSession} and {@link createSpritesSandbox}.
+ */
 export interface SpritesConnectionSettings {
   /**
    * Sprites API token (`org/projectNumber/tokenId/secret`). Defaults to the
@@ -41,16 +54,317 @@ export interface SpritesConnectionSettings {
   baseUrl?: string;
   /**
    * Working directory the session resolves relative paths against and reports
-   * as `defaultWorkingDirectory`. Defaults to `/home/sprite`.
+   * as `defaultWorkingDirectory`. Defaults to the directory the Sprite
+   * reports for a new process.
    */
   workingDirectory?: string;
+}
+
+/**
+ * Flattens an intersection of object types into a single object type so the
+ * resolved shape displays as its named properties rather than a chain of
+ * `A & B & C`.
+ */
+type Prettify<T> = { [K in keyof T]: T[K] } & {};
+
+/**
+ * An existing Sprite together with the facts the session API exposes
+ * synchronously. The Sprites API reports a Sprite's URL, URL auth and working
+ * directory only through asynchronous calls, so the native adaptation receives
+ * them alongside the Sprite's name instead of looking them up.
+ */
+export type SpritesNativeSandboxSession = Pick<
+  SpritesConnectionSettings,
+  'apiKey' | 'baseUrl'
+> & {
+  readonly sprite: {
+    /** Name of the Sprite. */
+    readonly name: string;
+
+    /** Public URL of the Sprite: `https://<name>-<suffix>.sprites.app`. */
+    readonly url: string;
+
+    /**
+     * URL auth mode the Sprite is on. Only a Sprite on `'public'` exposes its
+     * port, so leave it unset for a session that needs no bridge.
+     */
+    readonly urlAuth?: SpriteUrlAuth;
+  };
+
+  /**
+   * Absolute working directory of the Sprite: the directory it starts a
+   * process in, `/home/sprite` on the stock image.
+   */
+  readonly workingDirectory: string;
+};
+
+type SpritesCreationSettings = SpritesConnectionSettings & {
+  /**
+   * URL auth mode for the created Sprite. Defaults to `'public'`, which is
+   * the only mode a bridge-backed harness adapter can connect to.
+   */
+  urlAuth?: SpriteUrlAuth;
+  /** Block on capacity instead of failing fast when the fleet is full. */
+  waitForCapacity?: boolean;
+  /** The Sprite is named with `sandboxId`. */
+  name?: never;
+  spriteName?: never;
+};
+
+export type SpritesNetworkSandboxSessionCreateOptions = Prettify<
+  HarnessV1SandboxSessionCreateOptions<SpritesCreationSettings> & {
+    sandbox?: never;
+  }
+>;
+
+type SpritesLookupSettings = SpritesConnectionSettings & {
+  /**
+   * URL auth mode to put the Sprite on. Left as the Sprite has it when unset.
+   */
+  urlAuth?: SpriteUrlAuth;
+  /** The Sprite is looked up by `sandboxId`. */
+  name?: never;
+  spriteName?: never;
+};
+
+export type SpritesNetworkSandboxSessionResumeOptions = Prettify<
+  HarnessV1SandboxSessionResumeOptions<SpritesLookupSettings>
+>;
+
+/**
+ * Create a Sprite and return its network sandbox session. `sandboxId` names
+ * the Sprite; a Sprite that already has that name is a conflict, never a
+ * lookup. An optional `template` is prepared in the new Sprite before the
+ * session is returned. The caller owns the Sprite: `destroy()` deletes it.
+ */
+export async function createSpritesNetworkSandboxSession(
+  options: SpritesNetworkSandboxSessionCreateOptions = {},
+): Promise<HarnessV1NetworkSandboxSession> {
+  if ('sandbox' in options) {
+    throw new Error(
+      'createSpritesNetworkSandboxSession: use createSpritesNetworkSandboxSessionFromNativeSandbox for an existing Sprite.',
+    );
+  }
+  if ('spriteName' in options) {
+    throw new Error(
+      'createSpritesNetworkSandboxSession: use resumeSpritesNetworkSandboxSession({ sandboxId }) for an existing Sprite.',
+    );
+  }
+  const { template, abortSignal, sandboxId, waitForCapacity } = options;
+  abortSignal?.throwIfAborted();
+  const client = createSpritesApiClient(options);
+  const name = sandboxId ?? `${PREWARM_NAME_PREFIX}-${randomSuffix()}`;
+
+  const { sprite, created } = await withSpritesSandboxAuthenticationError(() =>
+    client.getOrCreateSprite({
+      name,
+      ...(waitForCapacity != null ? { waitForCapacity } : {}),
+      ...(abortSignal ? { abortSignal } : {}),
+    }),
+  );
+  if (!created) {
+    throw new Error(
+      `createSpritesNetworkSandboxSession: a Sprite named "${name}" already exists. Use resumeSpritesNetworkSandboxSession({ sandboxId }) to reattach to it.`,
+    );
+  }
+
+  try {
+    const urlAuth = options.urlAuth ?? 'public';
+    if (sprite.urlAuth !== urlAuth) {
+      await withSpritesSandboxAuthenticationError(() =>
+        client.setUrlAuth(sprite.name, urlAuth, abortSignal),
+      );
+    }
+    const session = new SpritesNetworkSandboxSession({
+      client,
+      sprite: { ...sprite, urlAuth },
+      workingDirectory:
+        options.workingDirectory ??
+        (await resolveSpriteWorkingDirectory({
+          client,
+          spriteName: sprite.name,
+          abortSignal,
+        })),
+      ownsLifecycle: true,
+    });
+    await ensurePnpm({ session, abortSignal });
+    // Sprites have no snapshot to start further Sprites from, so the template
+    // is prepared in every new Sprite.
+    await template?.prepare({
+      session: session.restricted(),
+      ...(abortSignal ? { abortSignal } : {}),
+    });
+    return session;
+  } catch (error) {
+    await client.deleteSprite(sprite.name).catch(() => {});
+    throw error;
+  }
+}
+
+/**
+ * Reattach to the existing Sprite named `sandboxId` and return its network
+ * sandbox session. Never creates a Sprite. The caller owns the Sprite:
+ * `destroy()` deletes it.
+ */
+export async function resumeSpritesNetworkSandboxSession(
+  options: SpritesNetworkSandboxSessionResumeOptions,
+): Promise<HarnessV1NetworkSandboxSession> {
+  const { sandboxId, abortSignal, urlAuth } = options;
+  abortSignal?.throwIfAborted();
+  const client = createSpritesApiClient(options);
+
+  const sprite = await withSpritesSandboxAuthenticationError(() =>
+    client.getSprite(sandboxId, abortSignal),
+  );
+  if (urlAuth != null && sprite.urlAuth !== urlAuth) {
+    await withSpritesSandboxAuthenticationError(() =>
+      client.setUrlAuth(sprite.name, urlAuth, abortSignal),
+    );
+  }
+  return new SpritesNetworkSandboxSession({
+    client,
+    sprite: urlAuth != null ? { ...sprite, urlAuth } : sprite,
+    workingDirectory:
+      options.workingDirectory ??
+      (await resolveSpriteWorkingDirectory({
+        client,
+        spriteName: sprite.name,
+        abortSignal,
+      })),
+    ownsLifecycle: true,
+  });
+}
+
+/**
+ * Adapt an existing Sprite to the file and process surface, without a request
+ * to the Sprites API.
+ */
+export function createSpritesSandboxSessionFromNativeSandbox(
+  nativeSandbox: SpritesNativeSandboxSession,
+): SandboxSession {
+  return new SpritesSandboxSession(
+    createSpritesApiClient(nativeSandbox),
+    nativeSandbox.sprite.name,
+    nativeSandbox.sprite.url,
+    nativeSandbox.workingDirectory,
+  );
+}
+
+/**
+ * Adapt an existing Sprite to a network sandbox session, without a request to
+ * the Sprites API. The caller owns the Sprite: `destroy()` deletes it.
+ */
+export function createSpritesNetworkSandboxSessionFromNativeSandbox(
+  nativeSandbox: SpritesNativeSandboxSession,
+): HarnessV1NetworkSandboxSession {
+  return new SpritesNetworkSandboxSession({
+    client: createSpritesApiClient(nativeSandbox),
+    sprite: nativeSandbox.sprite,
+    workingDirectory: nativeSandbox.workingDirectory,
+    ownsLifecycle: true,
+  });
+}
+
+function createSpritesApiClient(
+  settings: Pick<SpritesConnectionSettings, 'apiKey' | 'baseUrl'>,
+): SpritesApiClient {
+  const apiKey =
+    settings.apiKey ?? process.env.SPRITES_API_KEY ?? process.env.SPRITES_TOKEN;
+  if (apiKey == null || apiKey === '') {
+    throw new HarnessSandboxAuthenticationError({
+      message:
+        'Sprites API key is required. Pass `apiKey` or set the SPRITES_API_KEY environment variable.',
+      sandboxProviderId: SPRITES_PROVIDER_ID,
+    });
+  }
+  const baseUrl =
+    settings.baseUrl ?? process.env.SPRITES_API_URL ?? SPRITES_DEFAULT_BASE_URL;
+  return new SpritesApiClient({ apiKey, baseUrl });
+}
+
+const SPRITES_SANDBOX_AUTHENTICATION_MESSAGE =
+  'Sprites authentication failed. Pass `apiKey` or set the SPRITES_API_KEY environment variable, then verify that the token can access the Sprites API.';
+
+/**
+ * Rethrow rejected credentials (401, 403) from acquiring a Sprite as the
+ * error the harness uses to tell configuration failures apart.
+ */
+async function withSpritesSandboxAuthenticationError<T>(
+  operation: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await operation();
+  } catch (error) {
+    if (
+      !(error instanceof SpritesApiError) ||
+      (error.status !== 401 && error.status !== 403)
+    ) {
+      throw error;
+    }
+    throw new HarnessSandboxAuthenticationError({
+      message: SPRITES_SANDBOX_AUTHENTICATION_MESSAGE,
+      sandboxProviderId: SPRITES_PROVIDER_ID,
+      cause: error,
+    });
+  }
+}
+
+async function ensurePnpm({
+  session,
+  abortSignal,
+}: {
+  session: SandboxSession;
+  abortSignal: AbortSignal | undefined;
+}): Promise<void> {
+  const { exitCode, stdout, stderr } = await session.run({
+    command: PNPM_SETUP_COMMAND,
+    ...(abortSignal ? { abortSignal } : {}),
+  });
+  if (exitCode !== 0) {
+    throw new Error(
+      `Failed to install pnpm in the Sprite (exit ${exitCode}): ${stderr || stdout}`,
+    );
+  }
+}
+
+/**
+ * The directory a process starts in when no working directory is given, read
+ * from the Sprite itself rather than assumed.
+ */
+async function resolveSpriteWorkingDirectory({
+  client,
+  spriteName,
+  abortSignal,
+}: {
+  client: SpritesApiClient;
+  spriteName: string;
+  abortSignal: AbortSignal | undefined;
+}): Promise<string> {
+  const proc = await client.exec(spriteName, {
+    argv: ['pwd'],
+    ...(abortSignal ? { abortSignal } : {}),
+  });
+  const [stdout, stderr, { exitCode }] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.wait(),
+  ]);
+  const workingDirectory = stdout.trim();
+  if (exitCode !== 0 || !workingDirectory.startsWith('/')) {
+    throw new Error(
+      `Failed to resolve the working directory of Sprite "${spriteName}" (exit ${exitCode}): ${stderr || stdout}`,
+    );
+  }
+  return workingDirectory === '/'
+    ? workingDirectory
+    : workingDirectory.replace(/\/+$/, '');
 }
 
 /**
  * Settings for {@link createSpritesSandbox}. Two mutually-exclusive shapes:
  *
  * - `{ spriteName }` — wrap an already-created Sprite by name. The caller owns
- *   its lifecycle; the provider's `destroy()` is a no-op. `urlAuth` is left
+ *   its lifecycle; the session's `destroy()` is a no-op. `urlAuth` is left
  *   alone unless set: a wrapped Sprite left on `'sprite'` auth is unreachable
  *   to a stock WebSocket bridge client, which is redirected (302) at the auth
  *   gate instead of reaching the in-Sprite bridge. Set `urlAuth` to `'public'`
@@ -59,6 +373,8 @@ export interface SpritesConnectionSettings {
  *   session. When a `sessionId` is supplied the Sprite is named
  *   deterministically so `resumeSession({ sessionId })` can reattach. `urlAuth`
  *   defaults to `'public'` so bridge-backed adapters work out of the box.
+ *
+ * @deprecated Use `SpritesNetworkSandboxSessionCreateOptions` for new sessions.
  */
 export type SpritesSandboxSettings =
   | (SpritesConnectionSettings & {
@@ -75,6 +391,7 @@ export type SpritesSandboxSettings =
       waitForCapacity?: boolean;
     });
 
+/** @deprecated Use `createSpritesNetworkSandboxSession` instead. */
 export function createSpritesSandbox(
   settings: SpritesSandboxSettings = {} as SpritesSandboxSettings,
 ): HarnessV1SandboxProvider {
@@ -86,31 +403,31 @@ export function createSpritesSandbox(
  * Construct one via {@link createSpritesSandbox} at module scope and pass it to
  * a `HarnessAgent` (or call `createSession()` directly for raw access to a
  * network sandbox session).
+ *
+ * @deprecated Use `createSpritesNetworkSandboxSession` instead.
  */
 export class SpritesSandboxProvider implements HarnessV1SandboxProvider {
   readonly specificationVersion = 'harness-sandbox-v1' as const;
   readonly providerId = SPRITES_PROVIDER_ID;
 
   private readonly client: SpritesApiClient;
-  private readonly workingDirectory: string;
 
   constructor(private readonly settings: SpritesSandboxSettings) {
-    const apiKey =
-      settings.apiKey ??
-      process.env.SPRITES_API_KEY ??
-      process.env.SPRITES_TOKEN;
-    if (apiKey == null || apiKey === '') {
-      throw new Error(
-        'Sprites API key is required. Pass `apiKey` or set the SPRITES_API_KEY environment variable.',
-      );
-    }
-    const baseUrl =
-      settings.baseUrl ??
-      process.env.SPRITES_API_URL ??
-      SPRITES_DEFAULT_BASE_URL;
-    this.client = new SpritesApiClient({ apiKey, baseUrl });
-    this.workingDirectory =
-      settings.workingDirectory ?? DEFAULT_WORKING_DIRECTORY;
+    this.client = createSpritesApiClient(settings);
+  }
+
+  private async resolveWorkingDirectory(
+    spriteName: string,
+    abortSignal: AbortSignal | undefined,
+  ): Promise<string> {
+    return (
+      this.settings.workingDirectory ??
+      (await resolveSpriteWorkingDirectory({
+        client: this.client,
+        spriteName,
+        abortSignal,
+      }))
+    );
   }
 
   createSession = async (options?: {
@@ -126,24 +443,29 @@ export class SpritesSandboxProvider implements HarnessV1SandboxProvider {
 
     // Wrap-existing case: caller owns the Sprite.
     if ('spriteName' in this.settings && this.settings.spriteName != null) {
-      const sprite = await this.client.getSprite(
-        this.settings.spriteName,
-        options?.abortSignal,
+      const spriteName = this.settings.spriteName;
+      const sprite = await withSpritesSandboxAuthenticationError(() =>
+        this.client.getSprite(spriteName, options?.abortSignal),
       );
       if (
         this.settings.urlAuth != null &&
         sprite.urlAuth !== this.settings.urlAuth
       ) {
-        await this.client.setUrlAuth(
-          sprite.name,
-          this.settings.urlAuth,
-          options?.abortSignal,
+        const urlAuth = this.settings.urlAuth;
+        await withSpritesSandboxAuthenticationError(() =>
+          this.client.setUrlAuth(sprite.name, urlAuth, options?.abortSignal),
         );
       }
       return new SpritesNetworkSandboxSession({
         client: this.client,
-        sprite,
-        workingDirectory: this.workingDirectory,
+        sprite:
+          this.settings.urlAuth != null
+            ? { ...sprite, urlAuth: this.settings.urlAuth }
+            : sprite,
+        workingDirectory: await this.resolveWorkingDirectory(
+          sprite.name,
+          options?.abortSignal,
+        ),
         ownsLifecycle: false,
       });
     }
@@ -162,62 +484,79 @@ export class SpritesSandboxProvider implements HarnessV1SandboxProvider {
           ? `${TEMPLATE_NAME_PREFIX}-${sanitizeName(identity)}`
           : `${PREWARM_NAME_PREFIX}-${randomSuffix()}`);
 
-    const { sprite, created } = await this.client.getOrCreateSprite({
-      name,
-      ...(settings.waitForCapacity != null
-        ? { waitForCapacity: settings.waitForCapacity }
-        : {}),
-      ...(options?.abortSignal ? { abortSignal: options.abortSignal } : {}),
-    });
+    const { sprite, created } = await withSpritesSandboxAuthenticationError(
+      () =>
+        this.client.getOrCreateSprite({
+          name,
+          ...(settings.waitForCapacity != null
+            ? { waitForCapacity: settings.waitForCapacity }
+            : {}),
+          ...(options?.abortSignal ? { abortSignal: options.abortSignal } : {}),
+        }),
+    );
 
-    const urlAuth = settings.urlAuth ?? 'public';
-    if (sprite.urlAuth !== urlAuth) {
-      await this.client.setUrlAuth(sprite.name, urlAuth, options?.abortSignal);
-    }
+    try {
+      const urlAuth = settings.urlAuth ?? 'public';
+      if (sprite.urlAuth !== urlAuth) {
+        await withSpritesSandboxAuthenticationError(() =>
+          this.client.setUrlAuth(sprite.name, urlAuth, options?.abortSignal),
+        );
+      }
 
-    const session = new SpritesNetworkSandboxSession({
-      client: this.client,
-      sprite: { ...sprite, urlAuth },
-      workingDirectory: this.workingDirectory,
-      ownsLifecycle: true,
-    });
+      const workingDirectory = await this.resolveWorkingDirectory(
+        sprite.name,
+        options?.abortSignal,
+      );
+      const session = new SpritesNetworkSandboxSession({
+        client: this.client,
+        sprite: { ...sprite, urlAuth },
+        workingDirectory,
+        ownsLifecycle: true,
+      });
 
-    // Run one-time setup once per identity. Gate on a persisted completion
-    // marker (not the create-vs-409 result) so a setup that fails *after* the
-    // Sprite is created re-runs next time instead of leaving it permanently
-    // un-bootstrapped.
-    if (options?.onFirstCreate != null) {
-      const marker = identity != null ? this.markerPath(identity) : undefined;
-      const alreadyDone =
-        marker != null
-          ? !created &&
-            (await this.client.readFile(
+      await ensurePnpm({ session, abortSignal: options?.abortSignal });
+
+      // Run one-time setup once per identity. Gate on a persisted completion
+      // marker (not the create-vs-409 result) so a setup that fails *after* the
+      // Sprite is created re-runs next time instead of leaving it permanently
+      // un-bootstrapped.
+      if (options?.onFirstCreate != null) {
+        const marker =
+          identity != null ? markerPath(workingDirectory, identity) : undefined;
+        const alreadyDone =
+          marker != null
+            ? !created &&
+              (await this.client.readFile(
+                sprite.name,
+                marker,
+                options?.abortSignal,
+              )) != null
+            : !created;
+        if (!alreadyDone) {
+          await options.onFirstCreate(session.restricted(), {
+            ...(options?.abortSignal
+              ? { abortSignal: options.abortSignal }
+              : {}),
+          });
+          if (marker != null) {
+            await this.client.writeFile(
               sprite.name,
               marker,
+              BOOTSTRAP_MARKER,
               options?.abortSignal,
-            )) != null
-          : !created;
-      if (!alreadyDone) {
-        await options.onFirstCreate(session.restricted(), {
-          ...(options?.abortSignal ? { abortSignal: options.abortSignal } : {}),
-        });
-        if (marker != null) {
-          await this.client.writeFile(
-            sprite.name,
-            marker,
-            BOOTSTRAP_MARKER,
-            options?.abortSignal,
-          );
+            );
+          }
         }
       }
+
+      return session;
+    } catch (error) {
+      if (created) {
+        await this.client.deleteSprite(sprite.name).catch(() => {});
+      }
+      throw error;
     }
-
-    return session;
   };
-
-  private markerPath(identity: string): string {
-    return `${this.workingDirectory}/.ai-sdk-harness/bootstrap-${sanitizeName(identity)}.done`;
-  }
 
   resumeSession = async (options: {
     sessionId: string;
@@ -227,34 +566,44 @@ export class SpritesSandboxProvider implements HarnessV1SandboxProvider {
 
     // Wrap-existing case: caller owns the Sprite. Same session as createSession.
     if ('spriteName' in this.settings && this.settings.spriteName != null) {
-      const sprite = await this.client.getSprite(
-        this.settings.spriteName,
-        options.abortSignal,
+      const spriteName = this.settings.spriteName;
+      const sprite = await withSpritesSandboxAuthenticationError(() =>
+        this.client.getSprite(spriteName, options.abortSignal),
       );
       if (
         this.settings.urlAuth != null &&
         sprite.urlAuth !== this.settings.urlAuth
       ) {
-        await this.client.setUrlAuth(
-          sprite.name,
-          this.settings.urlAuth,
-          options.abortSignal,
+        const urlAuth = this.settings.urlAuth;
+        await withSpritesSandboxAuthenticationError(() =>
+          this.client.setUrlAuth(sprite.name, urlAuth, options.abortSignal),
         );
       }
       return new SpritesNetworkSandboxSession({
         client: this.client,
-        sprite,
-        workingDirectory: this.workingDirectory,
+        sprite:
+          this.settings.urlAuth != null
+            ? { ...sprite, urlAuth: this.settings.urlAuth }
+            : sprite,
+        workingDirectory: await this.resolveWorkingDirectory(
+          sprite.name,
+          options.abortSignal,
+        ),
         ownsLifecycle: false,
       });
     }
 
     const name = `${SESSION_NAME_PREFIX}-${sanitizeName(options.sessionId)}`;
-    const sprite = await this.client.getSprite(name, options.abortSignal);
+    const sprite = await withSpritesSandboxAuthenticationError(() =>
+      this.client.getSprite(name, options.abortSignal),
+    );
     return new SpritesNetworkSandboxSession({
       client: this.client,
       sprite,
-      workingDirectory: this.workingDirectory,
+      workingDirectory: await this.resolveWorkingDirectory(
+        sprite.name,
+        options.abortSignal,
+      ),
       ownsLifecycle: true,
     });
   };
@@ -305,6 +654,11 @@ function sanitizeName(value: string): string {
     // A slice can land mid-hyphen-run, re-introducing a trailing hyphen.
     .replace(/-+$/g, '');
   return slug.length > 0 ? `${slug}-${hash}` : hash;
+}
+
+function markerPath(workingDirectory: string, identity: string): string {
+  const base = workingDirectory === '/' ? '' : workingDirectory;
+  return `${base}/.ai-sdk-harness/bootstrap-${sanitizeName(identity)}.done`;
 }
 
 function randomSuffix(): string {

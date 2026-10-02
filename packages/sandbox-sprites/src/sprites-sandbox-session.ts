@@ -1,19 +1,20 @@
 import { posix } from 'node:path';
 import {
   extractLines,
-  type Experimental_SandboxProcess,
-  type Experimental_SandboxSession,
+  type Experimental_SandboxProcess as SandboxProcess,
+  type Experimental_SandboxSession as SandboxSession,
 } from '@ai-sdk/provider-utils';
 import type { SpritesApiClient } from './sprites-api-client';
 
 /**
  * `Experimental_SandboxSession` implementation backed by a Sprite. This is the
  * tool-safe surface (file I/O, exec, spawn); it is what
- * {@link SpritesNetworkSandboxSession.restricted} returns and is not
- * constructed directly by consumers. The network sandbox session owns the
- * lifetime of the underlying Sprite.
+ * {@link SpritesNetworkSandboxSession.restricted} and
+ * `createSpritesSandboxSessionFromNativeSandbox` return and is not
+ * constructed directly by consumers. It has no lifecycle of its own: only a
+ * network sandbox session can delete the underlying Sprite.
  */
-export class SpritesSandboxSession implements Experimental_SandboxSession {
+export class SpritesSandboxSession implements SandboxSession {
   constructor(
     protected readonly client: SpritesApiClient,
     protected readonly spriteName: string,
@@ -74,7 +75,7 @@ export class SpritesSandboxSession implements Experimental_SandboxSession {
     workingDirectory?: string;
     env?: Record<string, string>;
     abortSignal?: AbortSignal;
-  }): Promise<Experimental_SandboxProcess> {
+  }): Promise<SandboxProcess> {
     abortSignal?.throwIfAborted();
 
     return await this.client.exec(this.spriteName, {

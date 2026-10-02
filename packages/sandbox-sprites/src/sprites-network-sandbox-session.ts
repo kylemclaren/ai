@@ -2,12 +2,14 @@ import {
   HarnessCapabilityUnsupportedError,
   type HarnessV1NetworkPolicy,
   type HarnessV1NetworkSandboxSession,
+  type HarnessV1PortEndpoint,
 } from '@ai-sdk/harness';
 import type { Experimental_SandboxSession as SandboxSession } from '@ai-sdk/provider-utils';
 import {
   SPRITE_HTTP_PORT,
   type SpriteNetworkRule,
   type SpriteResource,
+  type SpriteUrlAuth,
   type SpritesApiClient,
 } from './sprites-api-client';
 import { SpritesSandboxSession } from './sprites-sandbox-session';
@@ -20,14 +22,20 @@ const SPRITES_PROVIDER_ID = 'sprites-sandbox';
  * lifecycle, network policy).
  *
  * Sprites proxy a single internal HTTP port ({@link SPRITE_HTTP_PORT}) to the
- * always-on public URL, so `ports` is exactly `[8080]` and `getPortUrl`
+ * always-on public URL, so `ports` is exactly `[8080]` and `getPortEndpoint`
  * resolves that one port to the public URL. Bridge-backed harness adapters
- * dial `getPortUrl({ port: 8080, protocol: 'ws' })` and append
+ * dial `getPortEndpoint({ port: 8080, protocol: 'ws' })` and append
  * `?agent_bridge_token=…`; the Sprite must have `url` auth set to `public` for
  * a stock WebSocket client (no auth header) to reach the in-Sprite bridge.
  *
- * The session owns the Sprite's lifecycle only when the provider created it;
- * when the provider wraps a caller-named Sprite, `destroy()` is a no-op.
+ * A Sprite on any other URL auth turns that client away at the auth gate, so
+ * its session exposes no port: `ports` is empty and `getPortEndpoint` throws.
+ * Such a session supports file and process access only and is not selected by
+ * bridge-backed adapters.
+ *
+ * `destroy()` deletes the Sprite when the session owns its lifecycle, which is
+ * every session except one the deprecated provider wraps around a
+ * caller-named Sprite (`spriteName`); there `destroy()` is a no-op.
  */
 export class SpritesNetworkSandboxSession
   extends SpritesSandboxSession
@@ -36,10 +44,11 @@ export class SpritesNetworkSandboxSession
   readonly id: string;
   readonly defaultWorkingDirectory: string;
   private readonly ownsLifecycle: boolean;
+  private readonly urlAuth: SpriteUrlAuth | undefined;
 
   constructor(input: {
     client: SpritesApiClient;
-    sprite: SpriteResource;
+    sprite: Pick<SpriteResource, 'name' | 'url' | 'urlAuth'>;
     workingDirectory: string;
     ownsLifecycle: boolean;
   }) {
@@ -49,15 +58,18 @@ export class SpritesNetworkSandboxSession
       input.sprite.url,
       input.workingDirectory,
     );
-    // The Sprite name is the durable lookup key the harness persists for
-    // cross-process resume (provider.resumeSession({ sessionId }) derives the
-    // same name).
+    // The Sprite name is the durable lookup key a caller persists for
+    // cross-process resume: resumeSpritesNetworkSandboxSession({ sandboxId })
+    // looks the Sprite up by it.
     this.id = input.sprite.name;
     this.defaultWorkingDirectory = input.workingDirectory;
     this.ownsLifecycle = input.ownsLifecycle;
+    this.urlAuth = input.sprite.urlAuth;
   }
 
-  readonly ports: ReadonlyArray<number> = [SPRITE_HTTP_PORT];
+  get ports(): ReadonlyArray<number> {
+    return this.urlAuth === 'public' ? [SPRITE_HTTP_PORT] : [];
+  }
 
   restricted(): SandboxSession {
     return new SpritesSandboxSession(
@@ -68,16 +80,24 @@ export class SpritesNetworkSandboxSession
     );
   }
 
-  getPortUrl = async (options: {
+  getPortEndpoint = async (options: {
     port: number;
     protocol?: 'http' | 'https' | 'ws';
-  }): Promise<string> => {
+  }): Promise<HarnessV1PortEndpoint> => {
     if (options.port !== SPRITE_HTTP_PORT) {
       throw new HarnessCapabilityUnsupportedError({
         harnessId: SPRITES_PROVIDER_ID,
         message:
           `Sprites proxy only the single HTTP port ${SPRITE_HTTP_PORT} to the public URL. ` +
           `Requested port ${options.port} is not reachable.`,
+      });
+    }
+    if (this.urlAuth !== 'public') {
+      throw new HarnessCapabilityUnsupportedError({
+        harnessId: SPRITES_PROVIDER_ID,
+        message:
+          `Sprite "${this.spriteName}" is not on public URL auth, so port ${SPRITE_HTTP_PORT} cannot be reached without Sprites credentials. ` +
+          "Set `urlAuth: 'public'` to expose it.",
       });
     }
     const url = new URL(this.spritePublicUrl);
@@ -93,7 +113,19 @@ export class SpritesNetworkSandboxSession
         url.protocol = isSecure ? 'wss:' : 'ws:';
         break;
     }
-    return url.toString();
+    // A public Sprite URL needs no headers: the bridge token in the query
+    // string is the only credential a stock WebSocket client presents.
+    return { url: url.toString() };
+  };
+
+  /**
+   * @deprecated Use `getPortEndpoint` instead.
+   */
+  getPortUrl = async (options: {
+    port: number;
+    protocol?: 'http' | 'https' | 'ws';
+  }): Promise<string> => {
+    return (await this.getPortEndpoint(options)).url;
   };
 
   setNetworkPolicy = async (policy: HarnessV1NetworkPolicy): Promise<void> => {
